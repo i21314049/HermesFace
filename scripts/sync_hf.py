@@ -509,20 +509,9 @@ def main():
         t = threading.Thread(target=sync.background_sync_loop, args=(stop_event,), daemon=True)
         t.start()
 
-        # 3. Start health check HTTP server (port 7860 — required by HF Spaces)
-        # Serves a status page while Hermes gateway boots up.
-        health_server = sync.start_health_server()
-
-        # 4. Start application
-        # Shutdown health server before Hermes starts (API server will take port 7860)
-        print("[SYNC] Stopping health server (API server will take port 7860)...")
-        health_server.shutdown()
-        time.sleep(1)
-
+        # 3. Start application (Hermes API server will bind port 7860)
         t0 = time.time()
         process = sync.run_hermes()
-        if process and hasattr(sync, '_hermes_process_ref'):
-            sync._hermes_process_ref[0] = process
         print(f"[TIMER] run_hermes launch: {time.time() - t0:.1f}s")
         print(f"[TIMER] Total startup (init → app launched): {time.time() - t_main_start:.1f}s")
 
