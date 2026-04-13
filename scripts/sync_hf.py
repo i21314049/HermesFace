@@ -433,11 +433,17 @@ pre {{ background: #161b22; padding: 16px; border-radius: 8px; overflow-x: auto;
 
         # Enable API server on port 7860 for HF Spaces (OpenAI-compatible endpoint)
         # This provides /health, /v1/chat/completions, /v1/models, etc.
+        # API_SERVER_KEY is required when binding to 0.0.0.0 (Hermes security requirement)
+        import secrets
+        api_key = env.get("API_SERVER_KEY", "") or secrets.token_urlsafe(32)
         env["API_SERVER_ENABLED"] = "true"
         env["API_SERVER_PORT"] = "7860"
         env["API_SERVER_HOST"] = "0.0.0.0"
+        env["API_SERVER_KEY"] = api_key
         env["API_SERVER_CORS_ORIGINS"] = "https://huggingface.co,https://*.hf.space"
-        print("[SYNC] API server configured on port 7860 (OpenAI-compatible)")
+        # Allow all users on HF Spaces (no allowlists needed)
+        env["GATEWAY_ALLOW_ALL_USERS"] = "true"
+        print(f"[SYNC] API server configured on port 7860 (key={'user-set' if env.get('API_SERVER_KEY') else 'auto-generated'})")
 
         try:
             process = subprocess.Popen(
