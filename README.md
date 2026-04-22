@@ -36,7 +36,7 @@ tags:
 ---
 
 <div align="center">
-  <img src="HermesFace.svg" alt="HermesFace" width="720"/>
+  <img src="HermesFace.png" alt="HermesFace" width="720"/>
   <br/><br/>
   <strong>Your always-on, self-improving AI agent — free, no server needed</strong>
   <br/>
