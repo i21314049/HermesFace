@@ -437,7 +437,10 @@ class HermesFullSync:
         self._patch_web_server_cors()
 
         # ── 2. Start web dashboard on port 7860 (HF Spaces frontend) ─
-        dashboard_cmd = [hermes_bin, "dashboard", "--host", "0.0.0.0", "--port", "7860", "--no-open"]
+        # --insecure: required to bind 0.0.0.0; HF Spaces already sandboxes the
+        # container and Repository Secrets are never exposed to the browser.
+        dashboard_cmd = [hermes_bin, "dashboard", "--host", "0.0.0.0", "--port", "7860",
+                         "--no-open", "--insecure"]
         print(f"[SYNC] Starting web dashboard on port 7860...")
         dashboard_proc = self._start_process(
             dashboard_cmd, "Dashboard", env, log_dir / "dashboard.log"
