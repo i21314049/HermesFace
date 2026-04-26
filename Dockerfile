@@ -1,12 +1,8 @@
 # HermesFace on Hugging Face Spaces — Source build
-# Builds Hermes Agent from source since no pre-built Docker image is published
-# Rebuild 2026-04-13: initial release
+# Builds Hermes Agent + hermes-web-ui from source
+# Rebuild 2026-04-26: integrate hermes-web-ui via hermes-agent-webui pattern
 
-# ── Stage 1: Build Hermes Agent from source ──────────────────────────────
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie AS uv_source
-FROM tianon/gosu:1.19-trixie AS gosu_source
-
-FROM debian:13.4
+FROM debian:bookworm-slim
 SHELL ["/bin/bash", "-c"]
 
 ENV PYTHONUNBUFFERED=1
@@ -16,18 +12,27 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 RUN echo "[build] Installing system deps..." && START=$(date +%s) \
   && apt-get update \
   && apt-get install -y --no-install-recommends \
-     build-essential nodejs npm python3 python3-pip python3-venv \
-     ripgrep ffmpeg gcc python3-dev libffi-dev procps \
+     build-essential libffi-dev libssl-dev \
+     python3 python3-venv python3-dev python3-pip \
+     ripgrep ffmpeg gcc procps tini \
      git ca-certificates curl \
   && rm -rf /var/lib/apt/lists/* \
   && pip3 install --no-cache-dir --break-system-packages huggingface_hub requests pyyaml \
   && echo "[build] System deps: $(($(date +%s) - START))s"
 
-# ── Non-root user ────────────────────────────────────────────────────────
-RUN useradd -u 10000 -m -d /opt/data hermes
+# ── Node.js v23 (hermes-web-ui requires node >= 23) ──────────────────────
+RUN echo "[build] Installing Node.js v23..." && START=$(date +%s) \
+  && ARCH=$(dpkg --print-architecture) \
+  && if [ "$ARCH" = "amd64" ]; then NODE_ARCH="x64"; else NODE_ARCH="$ARCH"; fi \
+  && curl -fsSL "https://nodejs.org/dist/v23.11.0/node-v23.11.0-linux-${NODE_ARCH}.tar.gz" \
+     -o /tmp/node.tar.gz \
+  && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+  && rm -f /tmp/node.tar.gz \
+  && node --version && npm --version \
+  && echo "[build] Node.js: $(($(date +%s) - START))s"
 
-COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+# ── Install uv ────────────────────────────────────────────────────────────
+RUN pip3 install --break-system-packages uv && uv --version
 
 # ── Clone and build Hermes Agent ─────────────────────────────────────────
 RUN echo "[build] Cloning Hermes Agent..." && START=$(date +%s) \
@@ -36,41 +41,47 @@ RUN echo "[build] Cloning Hermes Agent..." && START=$(date +%s) \
 
 WORKDIR /opt/hermes
 
-# ── Node dependencies + Playwright + Web Dashboard build ─────────────────
+# ── Python venv + dependencies ───────────────────────────────────────────
+RUN echo "[build] Installing Python deps..." && START=$(date +%s) \
+  && python3 -m venv .venv \
+  && .venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+  && uv pip install --python .venv/bin/python --no-cache-dir -e \
+     ".[messaging,cron,cli,pty,mcp,feishu,web,honcho,acp,homeassistant,sms]" \
+  && echo "[build] Python deps: $(($(date +%s) - START))s"
+
+# ── Node deps + Playwright ────────────────────────────────────────────────
 RUN echo "[build] Installing Node deps + Playwright..." && START=$(date +%s) \
   && npm install --prefer-offline --no-audit \
   && npx playwright install --with-deps chromium --only-shell \
   && if [ -d /opt/hermes/scripts/whatsapp-bridge ]; then \
        cd /opt/hermes/scripts/whatsapp-bridge && npm install --prefer-offline --no-audit; \
      fi \
-  && echo "[build] Building web dashboard..." \
-  && cd /opt/hermes/web && npm install --prefer-offline --no-audit && npm run build \
-  && cd /opt/hermes && npm cache clean --force \
-  && echo "[build] Node deps + web dashboard: $(($(date +%s) - START))s"
+  && npm cache clean --force \
+  && echo "[build] Node deps + Playwright: $(($(date +%s) - START))s"
 
-# ── Python dependencies ──────────────────────────────────────────────────
-RUN chown -R hermes:hermes /opt/hermes
-USER hermes
+# ── Clone and build hermes-web-ui ─────────────────────────────────────────
+RUN echo "[build] Cloning hermes-web-ui..." && START=$(date +%s) \
+  && git clone --depth 1 https://github.com/EKKOLearnAI/hermes-web-ui.git /app \
+  && cd /app \
+  && npm install \
+  && npm run build \
+  && npm prune --omit=dev \
+  && npm cache clean --force \
+  && echo "[build] hermes-web-ui: $(($(date +%s) - START))s"
 
-RUN echo "[build] Installing Python deps..." && START=$(date +%s) \
-  && cd /opt/hermes \
-  && uv venv \
-  && uv pip install --no-cache-dir -e ".[all]" \
-  && echo "[build] Python deps: $(($(date +%s) - START))s"
+# ── Prepare runtime dirs ─────────────────────────────────────────────────
+RUN mkdir -p /opt/data/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home} \
+  && mkdir -p /opt/data/hermes-web-ui
 
-USER root
-RUN chmod +x /opt/hermes/docker/entrypoint.sh
-
-# ── Prepare runtime dirs ────────────────────────────────────────────────
-RUN mkdir -p /opt/data/cron /opt/data/sessions /opt/data/logs /opt/data/hooks \
-             /opt/data/memories /opt/data/skills /opt/data/skins /opt/data/plans \
-             /opt/data/workspace /opt/data/home \
-  && chown -R hermes:hermes /opt/data
+# ── Non-root user (UID 10000 required by HF Spaces) ──────────────────────
+RUN useradd -u 10000 -m -d /opt/data hermes \
+  && chown -R hermes:hermes /opt/data /app \
+  && chmod -R g+rw /opt/data
 
 USER hermes
 
-# ── HermesFace scripts (persistence + entrypoint + DNS + assets) ──────
-ARG CACHE_BUST=2026-04-22-v2
+# ── HermesFace scripts + assets ──────────────────────────────────────────
+ARG CACHE_BUST=2026-04-26-webui-v2
 RUN echo "Build: ${CACHE_BUST}"
 COPY --chown=hermes:hermes scripts /opt/data/scripts
 COPY --chown=hermes:hermes assets /opt/data/assets
@@ -83,7 +94,12 @@ RUN chmod +x /opt/data/scripts/entrypoint.sh \
              /opt/data/scripts/restore_from_dataset_atomic.py
 
 ENV HERMES_HOME=/opt/data
-ENV PATH="/opt/hermes/.venv/bin:$PATH"
+ENV HOME=/opt/data
+ENV PATH="/opt/hermes/.venv/bin:${PATH}"
+ENV NODE_ENV=production
+
 WORKDIR /opt/data
 
-CMD ["/opt/data/scripts/entrypoint.sh"]
+EXPOSE 7860
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/data/scripts/entrypoint.sh"]
