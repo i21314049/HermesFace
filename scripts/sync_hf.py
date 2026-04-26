@@ -58,6 +58,7 @@ class TeeLogger:
 HF_TOKEN      = os.environ.get("HF_TOKEN")
 HERMES_DATA   = Path("/opt/data")
 APP_DIR       = Path("/opt/hermes")
+WEBUI_DIR     = Path("/app")
 DATASET_PATH  = "hermes_data"
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "HermesFace")
@@ -241,6 +242,7 @@ class HermesFullSync:
                     "__pycache__",  # Python cache
                     "scripts/*",    # HermesFace scripts — from git, not data
                     "assets/*",     # Static assets — from git, not data
+                    ".cache/*",     # 排除cache目录及其内容
                 ],
             )
             print(f"[SYNC] Upload completed at {datetime.now().isoformat()}")
@@ -259,28 +261,43 @@ class HermesFullSync:
     # ── Config helpers ─────────────────────────────────────────────────
 
     def _ensure_default_config(self):
-        """Ensure Hermes has config.yaml and .env for HF Spaces."""
+        """Ensure Hermes has config.yaml, .env, and SOUL.md for HF Spaces."""
         config_path = HERMES_DATA / "config.yaml"
         env_path = HERMES_DATA / ".env"
         soul_path = HERMES_DATA / "SOUL.md"
 
-        # Bootstrap from Hermes templates if available
+        # Bootstrap config.yaml
         if not config_path.exists():
             template = APP_DIR / "cli-config.yaml.example"
             if template.exists():
                 shutil.copy2(str(template), str(config_path))
                 print("[SYNC] Created config.yaml from Hermes template")
             else:
-                # Minimal fallback config
                 import yaml
                 config = {
                     "agent": {"name": AGENT_NAME},
-                    "server": {"host": "0.0.0.0", "port": 7860},
+                    "platforms": {
+                        "api_server": {
+                            "enabled": True,
+                            "key": "",
+                            "cors_origins": "*",
+                            "extra": {"port": 8642, "host": "127.0.0.1"},
+                        }
+                    },
+                    "terminal": {
+                        "backend": "local",
+                        "cwd": str(HERMES_DATA / "workspace"),
+                        "timeout": 180,
+                    },
                 }
                 with open(config_path, "w") as f:
                     yaml.dump(config, f, default_flow_style=False)
-                print(f"[SYNC] Created minimal config.yaml (agent={AGENT_NAME}, port=7860)")
+                print(f"[SYNC] Created minimal config.yaml")
 
+        # Always ensure api_server section exists (required by GatewayManager)
+        self._patch_config_api_server(config_path)
+
+        # Bootstrap .env
         if not env_path.exists():
             template = APP_DIR / ".env.example"
             if template.exists():
@@ -292,6 +309,7 @@ class HermesFullSync:
                     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
                     "NOUS_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY",
                     "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+                    "NVIDIA_API_KEY", "GATEWAY_ALLOW_ALL_USERS",
                 ]:
                     val = os.environ.get(key, "")
                     if val:
@@ -301,6 +319,7 @@ class HermesFullSync:
                         f.write("\n".join(env_lines) + "\n")
                     print(f"[SYNC] Created .env with {len(env_lines)} keys")
 
+        # Bootstrap SOUL.md
         if not soul_path.exists():
             template = APP_DIR / "docker" / "SOUL.md"
             if template.exists():
@@ -310,6 +329,29 @@ class HermesFullSync:
                 with open(soul_path, "w") as f:
                     f.write(f"# {AGENT_NAME}\n\nI am {AGENT_NAME}, a self-improving AI assistant powered by Hermes Agent.\n")
                 print("[SYNC] Created default SOUL.md")
+
+    def _patch_config_api_server(self, config_path):
+        """Ensure config.yaml has the api_server section needed by GatewayManager."""
+        try:
+            import yaml
+            with open(config_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            changed = False
+            if "platforms" not in cfg:
+                cfg["platforms"] = {}
+                changed = True
+            if "api_server" not in cfg.get("platforms", {}):
+                cfg["platforms"]["api_server"] = {
+                    "enabled": True, "key": "", "cors_origins": "*",
+                    "extra": {"port": 8642, "host": "127.0.0.1"},
+                }
+                changed = True
+            if changed:
+                with open(config_path, "w") as f:
+                    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+                print("[SYNC] Patched config.yaml: added api_server section for GatewayManager")
+        except Exception as e:
+            print(f"[SYNC] config.yaml patch warning (non-fatal): {e}")
 
     def _debug_list_files(self):
         try:
@@ -330,52 +372,35 @@ class HermesFullSync:
 
     # ── Application runner ─────────────────────────────────────────────
 
-    def _patch_web_server_cors(self):
-        """Patch Hermes web_server.py:
-        - Allow any origin (HF Spaces iframe, custom domains)
-        - Allow iframe embedding in huggingface.co + *.hf.space
-        """
-        ws_path = APP_DIR / "hermes_cli" / "web_server.py"
-        if not ws_path.exists():
-            return
-        try:
-            code = ws_path.read_text()
-            changed = False
+    def _cleanup_stale_gateway(self, hermes_bin):
+        """Clean up stale gateway.pid from previous run."""
+        pid_file = HERMES_DATA / "gateway.pid"
+        if pid_file.exists():
+            try:
+                data = json.loads(pid_file.read_text())
+                old_pid = data.get("pid")
+                if old_pid:
+                    try:
+                        os.kill(int(old_pid), 0)  # alive?
+                        subprocess.run(
+                            [hermes_bin, "gateway", "stop"],
+                            capture_output=True, timeout=5
+                        )
+                        time.sleep(2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+            except Exception:
+                pass
+            pid_file.unlink(missing_ok=True)
+            print("[SYNC] Cleaned up stale gateway state")
 
-            old_cors = 'allow_origin_regex=r"^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$"'
-            new_cors = 'allow_origins=["*"]'
-            if old_cors in code:
-                code = code.replace(old_cors, new_cors)
-                changed = True
-                print("[SYNC] Patched web_server.py CORS for HF Spaces")
-
-            # Neutralise X-Frame-Options so HF Spaces can embed the dashboard.
-            for pat in ('X-Frame-Options", "DENY"', 'X-Frame-Options", "SAMEORIGIN"'):
-                if pat in code:
-                    code = code.replace(pat, 'X-Frame-Options", "ALLOWALL"')
-                    changed = True
-                    print("[SYNC] Relaxed X-Frame-Options for HF Spaces")
-
-            # Relax CSP frame-ancestors if present.
-            csp_old = 'frame-ancestors \'none\''
-            csp_new = "frame-ancestors 'self' https://huggingface.co https://*.hf.space"
-            if csp_old in code:
-                code = code.replace(csp_old, csp_new)
-                changed = True
-                print("[SYNC] Relaxed CSP frame-ancestors for HF Spaces")
-
-            if changed:
-                ws_path.write_text(code)
-        except Exception as e:
-            print(f"[SYNC] web_server patch failed (non-fatal): {e}")
-
-    def _start_process(self, cmd, label, env, log_path):
+    def _start_process(self, cmd, label, env, log_path, cwd=None):
         """Helper to start a subprocess with output logging."""
         log_fh = open(log_path, "a")
         try:
             process = subprocess.Popen(
                 cmd,
-                cwd=str(APP_DIR),
+                cwd=str(cwd or APP_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -413,7 +438,15 @@ class HermesFullSync:
             return None
 
     def run_hermes(self):
-        """Start Hermes: web dashboard on port 7860, gateway in background if messaging tokens configured."""
+        """Start hermes-web-ui on port 7860.
+
+        Gateway is NOT started manually here.
+        hermes-web-ui's GatewayManager handles it automatically:
+          1. detectAllOnStartup() → detects Docker via /.dockerenv
+          2. stopAll() → cleans leftover processes
+          3. startAll() → runs 'hermes gateway run --replace'
+          4. Monitors health and restarts on failure
+        """
         log_dir = HERMES_DATA / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -423,40 +456,46 @@ class HermesFullSync:
 
         hermes_bin = shutil.which("hermes") or str(APP_DIR / ".venv" / "bin" / "hermes")
         if not Path(hermes_bin).exists():
-            print(f"[SYNC] ERROR: hermes CLI not found")
+            print(f"[SYNC] ERROR: hermes CLI not found at {hermes_bin}")
+            return None
+
+        # ── Ensure config has api_server for GatewayManager ──────────
+        config_path = HERMES_DATA / "config.yaml"
+        if config_path.exists():
+            self._patch_config_api_server(config_path)
+
+        # ── Clean up stale gateway.pid from previous run ──────────────
+        self._cleanup_stale_gateway(hermes_bin)
+
+        # ── Start hermes-web-ui on port 7860 ─────────────────────────
+        webui_server = WEBUI_DIR / "dist" / "server" / "index.js"
+        if not webui_server.exists():
+            print(f"[SYNC] ERROR: hermes-web-ui dist not found at {webui_server}")
+            print(f"[SYNC] Cannot start — check Dockerfile build logs")
             return None
 
         env = os.environ.copy()
         env["HERMES_HOME"] = str(HERMES_DATA)
+        env["HOME"] = str(HERMES_DATA)
+        env["PORT"] = "7860"
+        env["UPSTREAM"] = "http://127.0.0.1:8642"
+        env["HERMES_BIN"] = hermes_bin
+        env["AUTH_DISABLED"] = os.environ.get("AUTH_DISABLED", "1")
+        env["AUTH_TOKEN"] = os.environ.get("AUTH_TOKEN", "")
+        env["NODE_ENV"] = "production"
+        env["HERMES_WEB_UI_HOME"] = str(HERMES_DATA / "hermes-web-ui")
         env["GATEWAY_ALLOW_ALL_USERS"] = "true"
-        # Prevent gateway from grabbing port 7860
-        env.pop("API_SERVER_ENABLED", None)
-        env.pop("API_SERVER_PORT", None)
 
-        # ── 1. Patch web dashboard CORS for HF Spaces ────────────────
-        self._patch_web_server_cors()
+        (HERMES_DATA / "hermes-web-ui").mkdir(parents=True, exist_ok=True)
 
-        # ── 2. Start web dashboard on port 7860 (HF Spaces frontend) ─
-        # --insecure: required to bind 0.0.0.0; HF Spaces already sandboxes the
-        # container and Repository Secrets are never exposed to the browser.
-        dashboard_cmd = [hermes_bin, "dashboard", "--host", "0.0.0.0", "--port", "7860",
-                         "--no-open", "--insecure"]
-        print(f"[SYNC] Starting web dashboard on port 7860...")
-        dashboard_proc = self._start_process(
-            dashboard_cmd, "Dashboard", env, log_dir / "dashboard.log"
+        webui_cmd = ["node", str(webui_server)]
+        print(f"[SYNC] Starting hermes-web-ui on port 7860...")
+        print(f"[SYNC] Gateway will be auto-managed by GatewayManager")
+        webui_proc = self._start_process(
+            webui_cmd, "WebUI", env, log_dir / "webui.log", cwd=WEBUI_DIR
         )
 
-        # ── 3. Start gateway in background (messaging platforms + cron) ─
-        time.sleep(2)  # Let dashboard bind 7860 first
-        gateway_env = env.copy()
-        gateway_env["GATEWAY_ALLOW_ALL_USERS"] = "true"
-        gateway_cmd = [hermes_bin, "gateway"]
-        print(f"[SYNC] Starting gateway (messaging platforms)...")
-        self.gateway_proc = self._start_process(
-            gateway_cmd, "Gateway", gateway_env, log_dir / "gateway.log"
-        )
-
-        return dashboard_proc
+        return webui_proc
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -479,7 +518,7 @@ def main():
         t = threading.Thread(target=sync.background_sync_loop, args=(stop_event,), daemon=True)
         t.start()
 
-        # 3. Start application (Hermes API server will bind port 7860)
+        # 3. Start hermes-web-ui (gateway auto-managed by GatewayManager)
         t0 = time.time()
         process = sync.run_hermes()
         print(f"[TIMER] run_hermes launch: {time.time() - t0:.1f}s")
@@ -490,14 +529,7 @@ def main():
             print(f"\n[SYNC] Signal {sig} received. Shutting down...")
             stop_event.set()
             t.join(timeout=10)
-            # Stop gateway
-            if hasattr(sync, 'gateway_proc') and sync.gateway_proc:
-                sync.gateway_proc.terminate()
-                try:
-                    sync.gateway_proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    sync.gateway_proc.kill()
-            # Stop dashboard
+            # Stop webui
             if process:
                 process.terminate()
                 try:
@@ -513,13 +545,13 @@ def main():
 
         # Wait
         if process is None:
-            print("[SYNC] ERROR: Failed to start Hermes process. Exiting.")
+            print("[SYNC] ERROR: Failed to start hermes-web-ui. Exiting.")
             stop_event.set()
             t.join(timeout=5)
             sys.exit(1)
 
         exit_code = process.wait()
-        print(f"[SYNC] Hermes exited with code {exit_code}")
+        print(f"[SYNC] hermes-web-ui exited with code {exit_code}")
         stop_event.set()
         t.join(timeout=10)
         print("[SYNC] Final sync...")
