@@ -3,10 +3,11 @@ set -e
 
 BOOT_START=$(date +%s)
 
-echo "[entrypoint] HermesFace — Hermes Agent on HuggingFace Spaces"
-echo "[entrypoint] ===================================================="
+echo "[entrypoint] HermesFace — Hermes Agent + hermes-web-ui on HuggingFace Spaces"
+echo "[entrypoint] ================================================================="
 
 HERMES_HOME="/opt/data"
+HERMES_WEBUI_HOME="/opt/data/hermes-web-ui"
 INSTALL_DIR="/opt/hermes"
 
 # ── DNS pre-resolution (background — non-blocking) ────────────────────────
@@ -18,53 +19,36 @@ python3 /opt/data/scripts/dns-resolve.py /tmp/dns-resolved.json 2>&1 &
 DNS_PID=$!
 echo "[entrypoint] DNS resolver PID: $DNS_PID"
 
-# Enable Node.js DNS fix preload for playwright / whatsapp-bridge / web build.
+# Enable Node.js DNS fix preload for playwright / whatsapp-bridge
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /opt/data/scripts/dns-fix.cjs"
 
+# ── HF Space GatewayManager needs /.dockerenv to detect Docker env ────────
+# Without this file, GatewayManager tries "gateway start" (systemd) which
+# silently fails. This makes it use "gateway run" instead.
+if [ ! -f /.dockerenv ]; then
+  touch /.dockerenv 2>/dev/null || true
+  echo "[entrypoint] Created /.dockerenv for GatewayManager Docker detection"
+fi
+
 # ── Activate virtual environment ─────────────────────────────────────────
-if [ -f "${INSTALL_DIR}/.venv/bin/activate" ]; then
-  source "${INSTALL_DIR}/.venv/bin/activate"
-  echo "[entrypoint] Activated venv: $(which python3)"
-fi
+source "${INSTALL_DIR}/.venv/bin/activate"
+echo "[entrypoint] Activated venv: $(which python3)"
 
-# ── Ensure data directories ─────────────────────────────────────────────
+# ── Ensure data directories ──────────────────────────────────────────────
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
+mkdir -p "$HERMES_WEBUI_HOME"
+touch "$HERMES_HOME/logs/app.log"
 
-# ── Bootstrap config files ───────────────────────────────────────────────
-if [ ! -f "$HERMES_HOME/.env" ] && [ -f "$INSTALL_DIR/.env.example" ]; then
-  cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
-  echo "[entrypoint] Created .env from example"
-fi
+export HERMES_HOME
 
-if [ ! -f "$HERMES_HOME/config.yaml" ] && [ -f "$INSTALL_DIR/cli-config.yaml.example" ]; then
-  cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
-  echo "[entrypoint] Created config.yaml from example"
-fi
-
-if [ ! -f "$HERMES_HOME/SOUL.md" ] && [ -f "$INSTALL_DIR/docker/SOUL.md" ]; then
-  cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
-  echo "[entrypoint] Created SOUL.md from template"
-fi
-
-# ── Sync bundled skills ──────────────────────────────────────────────────
-if [ -d "$INSTALL_DIR/skills" ] && [ -f "$INSTALL_DIR/tools/skills_sync.py" ]; then
-  python3 "$INSTALL_DIR/tools/skills_sync.py" 2>&1 || echo "[entrypoint] Skills sync skipped"
-fi
-
-# ── Build artifacts check ───────────────────────────────────────────────
+# ── Build artifacts check ────────────────────────────────────────────────
 echo "[entrypoint] Build artifacts check:"
-test -f "$INSTALL_DIR/run_agent.py" && echo "  OK run_agent.py" || echo "  INFO: run_agent.py not found"
-test -f "$INSTALL_DIR/gateway/run.py" && echo "  OK gateway/run.py" || echo "  INFO: gateway/run.py not found"
-test -d "$INSTALL_DIR/web" && echo "  OK web/ dashboard" || echo "  INFO: web/ not found"
-command -v hermes >/dev/null 2>&1 && echo "  OK hermes CLI: $(which hermes)" || echo "  INFO: hermes CLI not in PATH"
-
-# Create logs
-mkdir -p /opt/data/logs
-touch /opt/data/logs/app.log
+command -v hermes >/dev/null 2>&1 && echo "  OK hermes CLI: $(which hermes)" || echo "  WARN: hermes CLI not in PATH"
+test -f /app/dist/server/index.js && echo "  OK hermes-web-ui dist" || echo "  WARN: hermes-web-ui dist not found"
 
 ENTRYPOINT_END=$(date +%s)
 echo "[TIMER] Entrypoint (before sync_hf.py): $((ENTRYPOINT_END - BOOT_START))s"
 
-# ── Start Hermes via sync_hf.py (handles persistence + process management)
-echo "[entrypoint] Starting Hermes Agent via sync_hf.py..."
+# ── Start HermesFace via sync_hf.py (handles persistence + webui launch) ─
+echo "[entrypoint] Starting HermesFace via sync_hf.py..."
 exec python3 -u /opt/data/scripts/sync_hf.py
